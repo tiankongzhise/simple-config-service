@@ -24,6 +24,10 @@ profile.cov
 go.work
 go.work.sum
 
+# Local Go caches used by sandboxed verification
+.gocache/
+.gomodcache/
+
 # env file
 .env
 
