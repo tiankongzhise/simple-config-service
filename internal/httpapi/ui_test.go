@@ -42,3 +42,18 @@ func TestPublicHandlerServesUIAssets(t *testing.T) {
 		t.Fatal("asset response did not include the UI script")
 	}
 }
+
+func TestUISubmitDispatchUsesFormAttributeID(t *testing.T) {
+	script, err := uiFiles.ReadFile("ui/assets/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := string(script)
+	if !strings.Contains(body, `const formID = form.getAttribute("id") || "";`) {
+		t.Fatal("submit handler should read the form id attribute")
+	}
+	if strings.Contains(body, `if (form.id === "config-form")`) {
+		t.Fatal("submit handler should not use form.id for config form dispatch")
+	}
+}

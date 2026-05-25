@@ -586,16 +586,17 @@ document.addEventListener("submit", async (event) => {
   const form = event.target;
   if (!(form instanceof HTMLFormElement)) return;
   event.preventDefault();
+  const formID = form.getAttribute("id") || "";
 
   await withFormLock(form, async () => {
-    if (form.id === "login-form") return submitLogin(form);
-    if (form.id === "register-form") return submitRegister(form);
-    if (form.id === "config-filter-form") return submitConfigFilters(form);
-    if (form.id === "config-form") return submitConfig(form);
-    if (form.id === "project-form") return submitProject(form);
-    if (form.id === "project-public-key-form") return submitProjectPublicKey(form);
-    if (form.id === "project-private-key-form") return submitProjectPrivateKey(form);
-    if (form.id === "rotate-user-key-form") return submitRotateUserKey(form);
+    if (formID === "login-form") return submitLogin(form);
+    if (formID === "register-form") return submitRegister(form);
+    if (formID === "config-filter-form") return submitConfigFilters(form);
+    if (formID === "config-form") return submitConfig(form);
+    if (formID === "project-form") return submitProject(form);
+    if (formID === "project-public-key-form") return submitProjectPublicKey(form);
+    if (formID === "project-private-key-form") return submitProjectPrivateKey(form);
+    if (formID === "rotate-user-key-form") return submitRotateUserKey(form);
   });
 });
 
