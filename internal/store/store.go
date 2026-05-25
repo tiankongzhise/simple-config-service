@@ -32,23 +32,62 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 type User struct {
-	ID           string    `json:"id"`
-	Username     string    `json:"username"`
-	PasswordHash string    `json:"-"`
-	Status       string    `json:"status"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID                            string               `json:"id"`
+	Username                      string               `json:"username"`
+	PasswordHash                  string               `json:"-"`
+	RSAPrivateKeyCiphertext       string               `json:"-"`
+	RSAPrivateKeyEncryptedDataKey string               `json:"-"`
+	RSAPrivateKeyNonce            string               `json:"-"`
+	RSAPrivateKeyAlgorithm        string               `json:"-"`
+	RSAPrivateKeyKeyID            string               `json:"-"`
+	RSAPublicKeyPEM               string               `json:"rsa_public_key"`
+	RSAPublicKeyFingerprint       string               `json:"rsa_public_key_fingerprint"`
+	Status                        string               `json:"status"`
+	CreatedAt                     time.Time            `json:"created_at"`
+	UpdatedAt                     time.Time            `json:"updated_at"`
+	RSAPrivateKeyPayload          configcrypto.Payload `json:"-"`
 }
 
 func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (User, error) {
-	row := s.db.QueryRowContext(ctx, `
-		INSERT INTO users (username, password_hash)
-		VALUES ($1, $2)
-		RETURNING id::text, username, password_hash, status, created_at, updated_at
-	`, username, passwordHash)
+	return s.CreateUserWithKeys(ctx, CreateUserParams{
+		Username:     username,
+		PasswordHash: passwordHash,
+	})
+}
 
-	var user User
-	if err := row.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Status, &user.CreatedAt, &user.UpdatedAt); err != nil {
+type CreateUserParams struct {
+	Username             string
+	PasswordHash         string
+	PrivateKeyPayload    configcrypto.Payload
+	PublicKeyPEM         string
+	PublicKeyFingerprint string
+}
+
+func (s *Store) CreateUserWithKeys(ctx context.Context, params CreateUserParams) (User, error) {
+	row := s.db.QueryRowContext(ctx, `
+		INSERT INTO users (
+			username, password_hash,
+			rsa_private_key_ciphertext, rsa_private_key_encrypted_data_key,
+			rsa_private_key_nonce, rsa_private_key_algorithm, rsa_private_key_key_id,
+			rsa_public_key_pem, rsa_public_key_fingerprint
+		)
+		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
+		RETURNING id::text, username, password_hash,
+			COALESCE(rsa_private_key_ciphertext, ''),
+			COALESCE(rsa_private_key_encrypted_data_key, ''),
+			COALESCE(rsa_private_key_nonce, ''),
+			COALESCE(rsa_private_key_algorithm, ''),
+			COALESCE(rsa_private_key_key_id, ''),
+			COALESCE(rsa_public_key_pem, ''),
+			COALESCE(rsa_public_key_fingerprint, ''),
+			status, created_at, updated_at
+	`, params.Username, params.PasswordHash,
+		params.PrivateKeyPayload.ValueCiphertext, params.PrivateKeyPayload.EncryptedDataKey,
+		params.PrivateKeyPayload.Nonce, params.PrivateKeyPayload.Algorithm, params.PrivateKeyPayload.KeyID,
+		params.PublicKeyPEM, params.PublicKeyFingerprint)
+
+	user, err := scanUser(row)
+	if err != nil {
 		if isUniqueViolation(err) {
 			return User{}, ErrConflict
 		}
@@ -59,7 +98,15 @@ func (s *Store) CreateUser(ctx context.Context, username, passwordHash string) (
 
 func (s *Store) GetUserByUsername(ctx context.Context, username string) (User, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id::text, username, password_hash, status, created_at, updated_at
+		SELECT id::text, username, password_hash,
+			COALESCE(rsa_private_key_ciphertext, ''),
+			COALESCE(rsa_private_key_encrypted_data_key, ''),
+			COALESCE(rsa_private_key_nonce, ''),
+			COALESCE(rsa_private_key_algorithm, ''),
+			COALESCE(rsa_private_key_key_id, ''),
+			COALESCE(rsa_public_key_pem, ''),
+			COALESCE(rsa_public_key_fingerprint, ''),
+			status, created_at, updated_at
 		FROM users
 		WHERE username = $1
 	`, username)
@@ -68,11 +115,51 @@ func (s *Store) GetUserByUsername(ctx context.Context, username string) (User, e
 
 func (s *Store) GetUserByID(ctx context.Context, userID string) (User, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id::text, username, password_hash, status, created_at, updated_at
+		SELECT id::text, username, password_hash,
+			COALESCE(rsa_private_key_ciphertext, ''),
+			COALESCE(rsa_private_key_encrypted_data_key, ''),
+			COALESCE(rsa_private_key_nonce, ''),
+			COALESCE(rsa_private_key_algorithm, ''),
+			COALESCE(rsa_private_key_key_id, ''),
+			COALESCE(rsa_public_key_pem, ''),
+			COALESCE(rsa_public_key_fingerprint, ''),
+			status, created_at, updated_at
 		FROM users
 		WHERE id = $1
 	`, userID)
 	return scanUser(row)
+}
+
+func (s *Store) UpdateUserRSAKey(ctx context.Context, userID string, payload configcrypto.Payload, publicKeyPEM, fingerprint string) (User, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE users
+		SET rsa_private_key_ciphertext = $2,
+			rsa_private_key_encrypted_data_key = $3,
+			rsa_private_key_nonce = $4,
+			rsa_private_key_algorithm = $5,
+			rsa_private_key_key_id = $6,
+			rsa_public_key_pem = $7,
+			rsa_public_key_fingerprint = $8,
+			updated_at = now()
+		WHERE id = $1
+		RETURNING id::text, username, password_hash,
+			COALESCE(rsa_private_key_ciphertext, ''),
+			COALESCE(rsa_private_key_encrypted_data_key, ''),
+			COALESCE(rsa_private_key_nonce, ''),
+			COALESCE(rsa_private_key_algorithm, ''),
+			COALESCE(rsa_private_key_key_id, ''),
+			COALESCE(rsa_public_key_pem, ''),
+			COALESCE(rsa_public_key_fingerprint, ''),
+			status, created_at, updated_at
+	`, userID, payload.ValueCiphertext, payload.EncryptedDataKey, payload.Nonce, payload.Algorithm, payload.KeyID, publicKeyPEM, fingerprint)
+	user, err := scanUser(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrNotFound
+		}
+		return User{}, err
+	}
+	return user, nil
 }
 
 type scanner interface {
@@ -81,13 +168,136 @@ type scanner interface {
 
 func scanUser(row scanner) (User, error) {
 	var user User
-	if err := row.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Status, &user.CreatedAt, &user.UpdatedAt); err != nil {
+	if err := row.Scan(
+		&user.ID,
+		&user.Username,
+		&user.PasswordHash,
+		&user.RSAPrivateKeyCiphertext,
+		&user.RSAPrivateKeyEncryptedDataKey,
+		&user.RSAPrivateKeyNonce,
+		&user.RSAPrivateKeyAlgorithm,
+		&user.RSAPrivateKeyKeyID,
+		&user.RSAPublicKeyPEM,
+		&user.RSAPublicKeyFingerprint,
+		&user.Status,
+		&user.CreatedAt,
+		&user.UpdatedAt,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
 		return User{}, err
 	}
+	user.RSAPrivateKeyPayload = configcrypto.Payload{
+		ValueCiphertext:  user.RSAPrivateKeyCiphertext,
+		EncryptedDataKey: user.RSAPrivateKeyEncryptedDataKey,
+		Nonce:            user.RSAPrivateKeyNonce,
+		Algorithm:        user.RSAPrivateKeyAlgorithm,
+		KeyID:            user.RSAPrivateKeyKeyID,
+	}
 	return user, nil
+}
+
+type Project struct {
+	ID                      string    `json:"id"`
+	UserID                  string    `json:"user_id"`
+	Name                    string    `json:"name"`
+	Description             string    `json:"description"`
+	RSAPublicKeyPEM         string    `json:"rsa_public_key"`
+	RSAPublicKeyFingerprint string    `json:"rsa_public_key_fingerprint"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+type CreateProjectParams struct {
+	UserID                  string
+	Name                    string
+	Description             string
+	RSAPublicKeyPEM         string
+	RSAPublicKeyFingerprint string
+}
+
+func (s *Store) CreateProject(ctx context.Context, params CreateProjectParams) (Project, error) {
+	row := s.db.QueryRowContext(ctx, `
+		INSERT INTO projects (user_id, name, description, rsa_public_key_pem, rsa_public_key_fingerprint)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id::text, user_id::text, name, description, rsa_public_key_pem, rsa_public_key_fingerprint, created_at, updated_at
+	`, params.UserID, params.Name, params.Description, params.RSAPublicKeyPEM, params.RSAPublicKeyFingerprint)
+	project, err := scanProject(row)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return Project{}, ErrConflict
+		}
+		return Project{}, err
+	}
+	return project, nil
+}
+
+func (s *Store) GetProjectByID(ctx context.Context, userID, projectID string) (Project, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id::text, user_id::text, name, description, rsa_public_key_pem, rsa_public_key_fingerprint, created_at, updated_at
+		FROM projects
+		WHERE user_id = $1 AND id = $2
+	`, userID, projectID)
+	return scanProject(row)
+}
+
+func (s *Store) ListProjects(ctx context.Context, userID string) ([]Project, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id::text, user_id::text, name, description, rsa_public_key_pem, rsa_public_key_fingerprint, created_at, updated_at
+		FROM projects
+		WHERE user_id = $1
+		ORDER BY name
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	projects := []Project{}
+	for rows.Next() {
+		project, err := scanProject(rows)
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return projects, nil
+}
+
+func (s *Store) UpdateProjectRSAKey(ctx context.Context, userID, projectID, publicKeyPEM, fingerprint string) (Project, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE projects
+		SET rsa_public_key_pem = $3,
+			rsa_public_key_fingerprint = $4,
+			updated_at = now()
+		WHERE user_id = $1 AND id = $2
+		RETURNING id::text, user_id::text, name, description, rsa_public_key_pem, rsa_public_key_fingerprint, created_at, updated_at
+	`, userID, projectID, publicKeyPEM, fingerprint)
+	return scanProject(row)
+}
+
+func scanProject(row scanner) (Project, error) {
+	var project Project
+	if err := row.Scan(
+		&project.ID,
+		&project.UserID,
+		&project.Name,
+		&project.Description,
+		&project.RSAPublicKeyPEM,
+		&project.RSAPublicKeyFingerprint,
+		&project.CreatedAt,
+		&project.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Project{}, ErrNotFound
+		}
+		return Project{}, err
+	}
+	return project, nil
 }
 
 type ConfigStatus string
@@ -100,6 +310,8 @@ const (
 type Config struct {
 	ID               string               `json:"id"`
 	UserID           string               `json:"user_id"`
+	ProjectID        string               `json:"project_id"`
+	ProjectName      string               `json:"project_name"`
 	Key              string               `json:"key"`
 	Application      string               `json:"application"`
 	Environment      string               `json:"environment"`
@@ -120,6 +332,7 @@ type Config struct {
 
 type CreateConfigParams struct {
 	UserID      string
+	ProjectID   string
 	Key         string
 	Application string
 	Environment string
@@ -131,6 +344,7 @@ type CreateConfigParams struct {
 type UpdateConfigParams struct {
 	UserID      string
 	ConfigID    string
+	ProjectID   string
 	Key         string
 	Application string
 	Environment string
@@ -141,6 +355,7 @@ type UpdateConfigParams struct {
 
 type ListConfigsParams struct {
 	UserID      string
+	ProjectID   string
 	Application string
 	Environment string
 	Limit       int
@@ -160,15 +375,17 @@ func (s *Store) CreateConfig(ctx context.Context, params CreateConfigParams) (Co
 
 	row := tx.QueryRowContext(ctx, `
 		INSERT INTO configs (
-			user_id, key, application, environment, description,
+			user_id, project_id, key, application, environment, description,
 			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
 			algorithm, key_id, status
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		RETURNING id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
+		VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), $11, $12, $13)
+		RETURNING id::text, user_id::text, COALESCE(project_id::text, ''),
+			COALESCE((SELECT name FROM projects WHERE projects.id = configs.project_id), ''),
+			key, application, environment, description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
 			algorithm, key_id, version, status, deleted_at, created_at, updated_at
-	`, params.UserID, params.Key, params.Application, params.Environment, params.Description,
+	`, params.UserID, params.ProjectID, params.Key, params.Application, params.Environment, params.Description,
 		params.Payload.ValueCiphertext, params.Payload.EncryptedDataKey, params.Payload.Nonce, params.Payload.DataKeyNonce,
 		params.Payload.Algorithm, params.Payload.KeyID, string(params.Status))
 
@@ -197,24 +414,27 @@ func (s *Store) UpdateConfig(ctx context.Context, params UpdateConfigParams) (Co
 
 	row := tx.QueryRowContext(ctx, `
 		UPDATE configs
-		SET key = $3,
-			application = $4,
-			environment = $5,
-			description = $6,
-			value_ciphertext = $7,
-			encrypted_data_key = $8,
-			nonce = $9,
-			data_key_nonce = $10,
-			algorithm = $11,
-			key_id = $12,
-			status = $13,
+		SET project_id = NULLIF($3, '')::uuid,
+			key = $4,
+			application = $5,
+			environment = $6,
+			description = $7,
+			value_ciphertext = $8,
+			encrypted_data_key = $9,
+			nonce = $10,
+			data_key_nonce = NULLIF($11, ''),
+			algorithm = $12,
+			key_id = $13,
+			status = $14,
 			version = version + 1,
 			updated_at = now()
 		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-		RETURNING id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
+		RETURNING id::text, user_id::text, COALESCE(project_id::text, ''),
+			COALESCE((SELECT name FROM projects WHERE projects.id = configs.project_id), ''),
+			key, application, environment, description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
 			algorithm, key_id, version, status, deleted_at, created_at, updated_at
-	`, params.ConfigID, params.UserID, params.Key, params.Application, params.Environment, params.Description,
+	`, params.ConfigID, params.UserID, params.ProjectID, params.Key, params.Application, params.Environment, params.Description,
 		params.Payload.ValueCiphertext, params.Payload.EncryptedDataKey, params.Payload.Nonce, params.Payload.DataKeyNonce,
 		params.Payload.Algorithm, params.Payload.KeyID, string(params.Status))
 
@@ -262,17 +482,21 @@ func (s *Store) ListConfigs(ctx context.Context, params ListConfigsParams) ([]Co
 	}
 
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
-			algorithm, key_id, version, status, deleted_at, created_at, updated_at
+		SELECT configs.id::text, configs.user_id::text, COALESCE(configs.project_id::text, ''),
+			COALESCE(projects.name, ''),
+			configs.key, configs.application, configs.environment, configs.description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
+			algorithm, key_id, version, status, deleted_at, configs.created_at, configs.updated_at
 		FROM configs
-		WHERE user_id = $1
-			AND deleted_at IS NULL
-			AND ($2 = '' OR application = $2)
-			AND ($3 = '' OR environment = $3)
-		ORDER BY application, environment, key
-		LIMIT $4 OFFSET $5
-	`, params.UserID, params.Application, params.Environment, params.Limit, params.Offset)
+		LEFT JOIN projects ON projects.id = configs.project_id
+		WHERE configs.user_id = $1
+			AND configs.deleted_at IS NULL
+			AND ($2 = '' OR configs.project_id = NULLIF($2, '')::uuid)
+			AND ($3 = '' OR configs.application = $3 OR projects.name = $3)
+			AND ($4 = '' OR configs.environment = $4)
+		ORDER BY COALESCE(projects.name, configs.application), configs.environment, configs.key
+		LIMIT $5 OFFSET $6
+	`, params.UserID, params.ProjectID, params.Application, params.Environment, params.Limit, params.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -282,18 +506,26 @@ func (s *Store) ListConfigs(ctx context.Context, params ListConfigsParams) ([]Co
 }
 
 func (s *Store) ListActiveConfigs(ctx context.Context, userID, application, environment string) ([]Config, error) {
+	return s.ListActiveProjectConfigs(ctx, userID, "", application, environment)
+}
+
+func (s *Store) ListActiveProjectConfigs(ctx context.Context, userID, projectID, application, environment string) ([]Config, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
-			algorithm, key_id, version, status, deleted_at, created_at, updated_at
+		SELECT configs.id::text, configs.user_id::text, COALESCE(configs.project_id::text, ''),
+			COALESCE(projects.name, ''),
+			configs.key, configs.application, configs.environment, configs.description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
+			algorithm, key_id, version, status, deleted_at, configs.created_at, configs.updated_at
 		FROM configs
-		WHERE user_id = $1
-			AND application = $2
-			AND environment = $3
-			AND status = $4
-			AND deleted_at IS NULL
-		ORDER BY key
-	`, userID, application, environment, string(ConfigEnabled))
+		LEFT JOIN projects ON projects.id = configs.project_id
+		WHERE configs.user_id = $1
+			AND ($2 = '' OR configs.project_id = NULLIF($2, '')::uuid)
+			AND ($3 = '' OR configs.application = $3 OR projects.name = $3)
+			AND configs.environment = $4
+			AND configs.status = $5
+			AND configs.deleted_at IS NULL
+		ORDER BY configs.key
+	`, userID, projectID, application, environment, string(ConfigEnabled))
 	if err != nil {
 		return nil, err
 	}
@@ -304,12 +536,15 @@ func (s *Store) ListActiveConfigs(ctx context.Context, userID, application, envi
 
 func (s *Store) ListConfigVersions(ctx context.Context, userID, configID string) ([]Config, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT config_id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
+		SELECT config_id::text, config_versions.user_id::text, COALESCE(config_versions.project_id::text, ''),
+			COALESCE(projects.name, ''),
+			config_versions.key, config_versions.application, config_versions.environment, config_versions.description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
 			algorithm, key_id, version, status, NULL::timestamptz AS deleted_at,
-			created_at, created_at AS updated_at
+			config_versions.created_at, config_versions.created_at AS updated_at
 		FROM config_versions
-		WHERE user_id = $1 AND config_id = $2
+		LEFT JOIN projects ON projects.id = config_versions.project_id
+		WHERE config_versions.user_id = $1 AND config_id = $2
 		ORDER BY version DESC
 	`, userID, configID)
 	if err != nil {
@@ -329,12 +564,15 @@ func (s *Store) RollbackConfig(ctx context.Context, userID, configID string, ver
 
 	var historical Config
 	row := tx.QueryRowContext(ctx, `
-		SELECT config_id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
+		SELECT config_id::text, config_versions.user_id::text, COALESCE(config_versions.project_id::text, ''),
+			COALESCE(projects.name, ''),
+			config_versions.key, config_versions.application, config_versions.environment, config_versions.description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
 			algorithm, key_id, version, status, NULL::timestamptz AS deleted_at,
-			created_at, created_at AS updated_at
+			config_versions.created_at, config_versions.created_at AS updated_at
 		FROM config_versions
-		WHERE user_id = $1 AND config_id = $2 AND version = $3
+		LEFT JOIN projects ON projects.id = config_versions.project_id
+		WHERE config_versions.user_id = $1 AND config_id = $2 AND version = $3
 	`, userID, configID, version)
 	historical, err = scanConfig(row)
 	if err != nil {
@@ -343,24 +581,27 @@ func (s *Store) RollbackConfig(ctx context.Context, userID, configID string, ver
 
 	row = tx.QueryRowContext(ctx, `
 		UPDATE configs
-		SET key = $3,
-			application = $4,
-			environment = $5,
-			description = $6,
-			value_ciphertext = $7,
-			encrypted_data_key = $8,
-			nonce = $9,
-			data_key_nonce = $10,
-			algorithm = $11,
-			key_id = $12,
-			status = $13,
+		SET project_id = NULLIF($3, '')::uuid,
+			key = $4,
+			application = $5,
+			environment = $6,
+			description = $7,
+			value_ciphertext = $8,
+			encrypted_data_key = $9,
+			nonce = $10,
+			data_key_nonce = NULLIF($11, ''),
+			algorithm = $12,
+			key_id = $13,
+			status = $14,
 			version = version + 1,
 			updated_at = now()
 		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-		RETURNING id::text, user_id::text, key, application, environment, description,
-			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
+		RETURNING id::text, user_id::text, COALESCE(project_id::text, ''),
+			COALESCE((SELECT name FROM projects WHERE projects.id = configs.project_id), ''),
+			key, application, environment, description,
+			value_ciphertext, encrypted_data_key, nonce, COALESCE(data_key_nonce, ''),
 			algorithm, key_id, version, status, deleted_at, created_at, updated_at
-	`, configID, userID, historical.Key, historical.Application, historical.Environment, historical.Description,
+	`, configID, userID, historical.ProjectID, historical.Key, historical.Application, historical.Environment, historical.Description,
 		historical.ValueCiphertext, historical.EncryptedDataKey, historical.Nonce, historical.DataKeyNonce,
 		historical.Algorithm, historical.KeyID, string(historical.Status))
 	config, err := scanConfig(row)
@@ -399,6 +640,8 @@ func scanConfig(row scanner) (Config, error) {
 	if err := row.Scan(
 		&config.ID,
 		&config.UserID,
+		&config.ProjectID,
+		&config.ProjectName,
 		&config.Key,
 		&config.Application,
 		&config.Environment,
@@ -449,12 +692,12 @@ func scanConfigs(rows *sql.Rows) ([]Config, error) {
 func insertVersion(ctx context.Context, tx *sql.Tx, config Config) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO config_versions (
-			config_id, user_id, version, key, application, environment, description,
+			config_id, user_id, project_id, version, key, application, environment, description,
 			value_ciphertext, encrypted_data_key, nonce, data_key_nonce,
 			algorithm, key_id, status
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-	`, config.ID, config.UserID, config.Version, config.Key, config.Application, config.Environment, config.Description,
+		VALUES ($1, $2, NULLIF($3, '')::uuid, $4, $5, $6, $7, $8, $9, $10, $11, NULLIF($12, ''), $13, $14, $15)
+	`, config.ID, config.UserID, config.ProjectID, config.Version, config.Key, config.Application, config.Environment, config.Description,
 		config.ValueCiphertext, config.EncryptedDataKey, config.Nonce, config.DataKeyNonce,
 		config.Algorithm, config.KeyID, string(config.Status))
 	return err
