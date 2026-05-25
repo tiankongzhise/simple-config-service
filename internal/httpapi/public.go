@@ -43,6 +43,7 @@ func (h *PublicHandler) routes() {
 	h.mux.HandleFunc("DELETE /api/configs/{id}", h.auth(h.deleteConfig))
 	h.mux.HandleFunc("GET /api/configs/{id}/versions", h.auth(h.listVersions))
 	h.mux.HandleFunc("POST /api/configs/{id}/rollback", h.auth(h.rollback))
+	h.mux.HandleFunc("GET /", h.ui)
 }
 
 type authenticatedHandler func(http.ResponseWriter, *http.Request, app.PublicUser)
