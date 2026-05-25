@@ -1,10 +1,10 @@
 # simple-config-service 用户使用指南
 
-这份指南从零开始演示如何启动服务、注册账号、登录、管理配置，以及如何通过内网查询接口获取密文配置。
+这份指南演示如何启动服务、注册账号、管理项目和配置，以及如何通过内网接口获取按项目公钥加密后的密文配置。
 
 ## 1. 准备环境
 
-你需要先准备：
+需要准备：
 
 - Go 1.24 或更高版本。
 - PostgreSQL 13 或更高版本。
@@ -18,15 +18,13 @@ CREATE USER config_service WITH PASSWORD 'change-me';
 GRANT ALL PRIVILEGES ON DATABASE config_service TO config_service;
 ```
 
-如果你的 PostgreSQL 对 public schema 权限收得比较紧，还需要连接到 `config_service` 数据库后执行：
+如果 PostgreSQL 对 public schema 权限较严格，还需要连接到 `config_service` 数据库后执行：
 
 ```sql
 GRANT ALL ON SCHEMA public TO config_service;
 ```
 
 ## 2. 配置 .env
-
-复制示例配置：
 
 ```powershell
 Copy-Item .env.example .env
@@ -44,7 +42,11 @@ pg_sslmode=disable
 
 invite_code=my-invite-code
 jwt_secret=replace-with-a-long-random-jwt-secret
-config_master_key=0123456789abcdef0123456789abcdef
+
+service_private_key_path=keys/service_private.pem
+service_public_key_path=keys/service_public.pem
+
+config_master_key=
 config_key_id=default
 
 public_listen_addr=0.0.0.0:8080
@@ -52,53 +54,27 @@ internal_listen_addr=127.0.0.1:8081
 jwt_ttl=24h
 ```
 
-重要说明：
+说明：
 
-- `invite_code` 是注册邀请码，没有邀请码不能注册。
-- `jwt_secret` 至少 16 字节，生产环境要使用随机强密钥。
-- `config_master_key` 必须是 32 字节密钥、64 位十六进制字符串，或 32 字节内容的 base64 编码。
-- `internal_listen_addr` 建议只绑定内网地址，例如 `127.0.0.1:8081` 或内网网卡地址。
+- `invite_code` 是注册邀请码。
+- `jwt_secret` 至少 16 字节，生产环境应使用随机强密钥。
+- `service_private_key_path` 和 `service_public_key_path` 是服务本地 RSA 密钥路径；首次启动会自动生成。
+- `config_master_key` 仅用于读取历史 `AES-256-GCM` 数据，新数据可以留空。
 
 ## 3. 启动服务
-
-执行：
 
 ```powershell
 go run ./cmd/config-service
 ```
 
-看到类似日志说明启动成功：
+服务启动时会执行数据库迁移，并生成或复用：
 
-```text
-server listening name=public addr=0.0.0.0:8080
-server listening name=internal addr=127.0.0.1:8081
-```
+- `keys/service_private.pem`
+- `keys/service_public.pem`
 
-服务第一次启动时会自动创建数据库表，不需要手工执行迁移文件。
+## 4. 注册和登录
 
-## 4. 检查健康状态
-
-公网管理服务：
-
-```powershell
-curl http://127.0.0.1:8080/healthz
-```
-
-内网查询服务：
-
-```powershell
-curl http://127.0.0.1:8081/healthz
-```
-
-正常响应：
-
-```json
-{"status":"ok"}
-```
-
-## 5. 注册账号
-
-注册时必须使用 `.env` 中配置的邀请码：
+注册时可以传入已有 RSA 私钥；如果不传，系统会生成一把用户私钥并保存其服务密文。
 
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/register `
@@ -106,21 +82,14 @@ curl -X POST http://127.0.0.1:8080/api/register `
   -d "{\"username\":\"alice\",\"password\":\"password123\",\"invite_code\":\"my-invite-code\"}"
 ```
 
-成功后会返回 `access_token` 和用户信息。记录返回中的：
-
-- `access_token`：后续管理接口要使用。
-- `user.id`：内网查询接口需要通过 `X-Config-User-ID` 传递。
-
-PowerShell 中可以先保存 token：
+保存响应中的 token 和用户 ID：
 
 ```powershell
 $token = "<access_token>"
 $userId = "<user.id>"
 ```
 
-## 6. 登录账号
-
-已有账号可以直接登录：
+已有账号登录：
 
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/login `
@@ -128,42 +97,71 @@ curl -X POST http://127.0.0.1:8080/api/login `
   -d "{\"username\":\"alice\",\"password\":\"password123\"}"
 ```
 
-如果密码错误，会返回 `401 unauthorized`。
+## 5. 获取用户公钥
+
+客户端提交配置值前，先获取当前用户公钥：
+
+```powershell
+curl http://127.0.0.1:8080/api/users/me/public-key `
+  -H "Authorization: Bearer $token"
+```
+
+响应：
+
+```json
+{
+  "algorithm": "RSA-OAEP-SHA256+A256GCM",
+  "key_id": "user:<id>:<fingerprint>",
+  "rsa_public_key": "-----BEGIN PUBLIC KEY-----..."
+}
+```
+
+客户端使用这个公钥把配置值加密成 `encrypted_value` 后再提交给后端。
+
+## 6. 创建项目
+
+项目需要提供 RSA 公钥。后续这个项目的配置返回值都会使用该项目公钥加密。
+
+```powershell
+curl -X POST http://127.0.0.1:8080/api/projects `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $token" `
+  -d "{\"name\":\"order-service\",\"description\":\"订单服务\",\"rsa_public_key\":\"-----BEGIN PUBLIC KEY-----...\"}"
+```
+
+保存返回的 `id`：
+
+```powershell
+$projectId = "<project.id>"
+```
 
 ## 7. 创建配置
 
-创建一条生产环境配置：
+请求体中的 `encrypted_value` 必须是使用当前用户公钥加密后的 RSA 信封密文：
 
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/configs `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer $token" `
-  -d "{\"key\":\"db.password\",\"value\":\"secret-password\",\"application\":\"order-service\",\"environment\":\"prod\",\"description\":\"订单服务数据库密码\",\"status\":\"enabled\"}"
+  -d "{\"project_id\":\"$projectId\",\"key\":\"db.password\",\"environment\":\"prod\",\"description\":\"数据库密码\",\"status\":\"enabled\",\"encrypted_value\":{\"algorithm\":\"RSA-OAEP-SHA256+A256GCM\",\"key_id\":\"user:<id>:<fingerprint>\",\"encrypted_data_key\":\"...\",\"nonce\":\"...\",\"value_ciphertext\":\"...\"}}"
 ```
 
-响应里不会出现明文 `secret-password`，只会出现：
+后端会：
 
-- `value_ciphertext`
-- `encrypted_data_key`
-- `nonce`
-- `data_key_nonce`
-- `algorithm`
-- `key_id`
+1. 用用户私钥解开请求中的 `encrypted_value`。
+2. 用服务本地 RSA 公钥重新加密后写入数据库。
+3. 返回时再用项目 RSA 公钥加密为新的 `encrypted_value`。
 
-这说明配置已经加密落库。
+## 8. 查询和更新配置
 
-## 8. 查询配置列表
+按项目查询：
 
 ```powershell
-curl "http://127.0.0.1:8080/api/configs?application=order-service&environment=prod" `
+curl "http://127.0.0.1:8080/api/configs?project_id=$projectId&environment=prod" `
   -H "Authorization: Bearer $token"
 ```
 
-这个接口是给管理后台使用的，仍然只返回密文，不返回明文。
-
-## 9. 更新配置
-
-先从列表响应中找到配置 `id`，然后更新：
+更新配置：
 
 ```powershell
 $configId = "<config.id>"
@@ -171,77 +169,72 @@ $configId = "<config.id>"
 curl -X PUT "http://127.0.0.1:8080/api/configs/$configId" `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer $token" `
-  -d "{\"key\":\"db.password\",\"value\":\"new-secret-password\",\"application\":\"order-service\",\"environment\":\"prod\",\"description\":\"更新后的数据库密码\",\"status\":\"enabled\"}"
+  -d "{\"project_id\":\"$projectId\",\"key\":\"db.password\",\"environment\":\"prod\",\"description\":\"更新后的数据库密码\",\"status\":\"enabled\",\"encrypted_value\":{\"algorithm\":\"RSA-OAEP-SHA256+A256GCM\",\"key_id\":\"user:<id>:<fingerprint>\",\"encrypted_data_key\":\"...\",\"nonce\":\"...\",\"value_ciphertext\":\"...\"}}"
 ```
 
-每次更新都会让 `version` 增加，并写入版本历史。
-
-## 10. 查看版本历史
+版本历史和回滚：
 
 ```powershell
 curl "http://127.0.0.1:8080/api/configs/$configId/versions" `
   -H "Authorization: Bearer $token"
-```
 
-版本历史可以用于审计和回滚。
-
-## 11. 回滚配置
-
-回滚到版本 1：
-
-```powershell
 curl -X POST "http://127.0.0.1:8080/api/configs/$configId/rollback" `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer $token" `
   -d "{\"version\":1}"
 ```
 
-回滚不会覆盖历史记录，而是生成一个新的当前版本。
+## 9. 更换密钥
 
-## 12. 禁用或删除配置
-
-禁用配置可以通过更新 `status` 实现：
+更换用户 RSA 私钥：
 
 ```powershell
-curl -X PUT "http://127.0.0.1:8080/api/configs/$configId" `
+curl -X PUT http://127.0.0.1:8080/api/users/me/rsa-private-key `
   -H "Content-Type: application/json" `
   -H "Authorization: Bearer $token" `
-  -d "{\"key\":\"db.password\",\"value\":\"new-secret-password\",\"application\":\"order-service\",\"environment\":\"prod\",\"description\":\"临时禁用\",\"status\":\"disabled\"}"
+  -d "{\"rsa_private_key\":\"-----BEGIN PRIVATE KEY-----...\"}"
 ```
 
-软删除配置：
+如果 `rsa_private_key` 为空字符串，系统会重新生成一把用户私钥。
+
+更换项目 RSA 公钥：
 
 ```powershell
-curl -X DELETE "http://127.0.0.1:8080/api/configs/$configId" `
-  -H "Authorization: Bearer $token"
+curl -X PUT "http://127.0.0.1:8080/api/projects/$projectId/rsa-public-key" `
+  -H "Content-Type: application/json" `
+  -H "Authorization: Bearer $token" `
+  -d "{\"rsa_public_key\":\"-----BEGIN PUBLIC KEY-----...\"}"
 ```
 
-被禁用或删除的配置不会出现在内网查询接口中。
+密钥更换只影响后续请求和后续返回，不会扫描重写历史数据。
 
-## 13. 通过内网接口查询配置
+## 10. 内网查询
 
-前置鉴权网关完成鉴权后，应把用户 ID 传给配置中心：
+前置鉴权网关完成鉴权后，把用户 ID 传给配置中心：
 
 ```powershell
-curl "http://127.0.0.1:8081/internal/configs?application=order-service&environment=prod" `
+curl "http://127.0.0.1:8081/internal/configs?project_id=$projectId&environment=prod" `
   -H "X-Config-User-ID: $userId"
 ```
 
-响应示例：
+响应中的 `encrypted_value` 已按项目公钥加密：
 
 ```json
 {
-  "application": "order-service",
+  "project_id": "<project_id>",
   "environment": "prod",
   "configs": [
     {
+      "project_id": "<project_id>",
+      "project_name": "order-service",
       "key": "db.password",
-      "value_ciphertext": "...",
-      "encrypted_data_key": "...",
-      "nonce": "...",
-      "data_key_nonce": "...",
-      "algorithm": "AES-256-GCM",
-      "key_id": "default",
+      "encrypted_value": {
+        "algorithm": "RSA-OAEP-SHA256+A256GCM",
+        "key_id": "project:<id>:<fingerprint>",
+        "encrypted_data_key": "...",
+        "nonce": "...",
+        "value_ciphertext": "..."
+      },
       "version": 2,
       "updated_at": "2026-05-21T10:00:00Z"
     }
@@ -249,77 +242,25 @@ curl "http://127.0.0.1:8081/internal/configs?application=order-service&environme
 }
 ```
 
-注意：这个接口不会返回明文配置。
+业务方使用项目私钥解密 `encrypted_value` 得到真实配置值。
 
-## 14. 客户端解密思路
-
-业务方拿到内网查询接口返回的密文后，需要在客户端或业务 SDK 中解密。
-
-解密需要：
-
-- `.env` 中对应的 `config_master_key`。
-- 接口返回的 `value_ciphertext`。
-- 接口返回的 `encrypted_data_key`。
-- 接口返回的 `nonce`。
-- 接口返回的 `data_key_nonce`。
-- 接口返回的 `algorithm`。
-- 接口返回的 `key_id`。
-
-仓库中已经提供了解密逻辑，位置是 `pkg/configcrypto`。同一个 Go 项目中可按下面方式使用：
-
-```go
-payload := configcrypto.Payload{
-    ValueCiphertext:  "...",
-    EncryptedDataKey: "...",
-    Nonce:            "...",
-    DataKeyNonce:     "...",
-    Algorithm:        "AES-256-GCM",
-    KeyID:            "default",
-}
-
-masterKey, err := configcrypto.ParseMasterKey("0123456789abcdef0123456789abcdef")
-if err != nil {
-    panic(err)
-}
-
-plaintext, err := configcrypto.Decrypt(masterKey, payload)
-if err != nil {
-    panic(err)
-}
-fmt.Println(string(plaintext))
-```
-
-生产环境建议封装一个业务 SDK，由 SDK 负责：
-
-- 调用内网查询接口。
-- 缓存配置。
-- 解密配置。
-- 处理查询失败、解密失败和配置不存在等错误。
-
-## 15. 常见问题
+## 11. 常见问题
 
 注册返回 `403 forbidden`：
 
-- 检查请求里的 `invite_code` 是否和 `.env` 完全一致。
+- 检查 `invite_code` 是否与 `.env` 完全一致。
 
 接口返回 `401 unauthorized`：
 
-- 检查是否传了 `Authorization: Bearer <access_token>`。
+- 检查是否传入 `Authorization: Bearer <access_token>`。
 - 检查 token 是否过期。
+
+配置写入返回 `encrypted_value: could not be decrypted`：
+
+- 检查请求中的 `encrypted_value` 是否由当前用户公钥加密。
+- 检查 `algorithm` 是否为 `RSA-OAEP-SHA256+A256GCM`。
 
 内网查询返回空列表：
 
-- 检查 `X-Config-User-ID` 是否是正确用户 ID。
-- 检查 `application` 和 `environment` 是否匹配。
-- 检查配置状态是否为 `enabled`。
-- 检查配置是否已被删除。
-
-服务启动失败：
-
-- 检查 PostgreSQL 是否可连接。
-- 检查 `.env` 是否包含所有必填项。
-- 检查 `config_master_key` 是否是合法 32 字节密钥。
-
-数据库里看不到明文配置：
-
-- 这是预期行为。配置值只会以密文形式保存。
+- 检查 `X-Config-User-ID`、`project_id` 和 `environment` 是否匹配。
+- 检查配置状态是否为 `enabled`，且未被删除。

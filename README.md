@@ -1,43 +1,29 @@
 # simple-config-service
 
-一个轻量级 Go 配置中心，使用 PostgreSQL 作为后端存储，适合中小型服务把运行配置集中管理起来。
+一个轻量级 Go 配置中心，使用 PostgreSQL 存储配置和版本历史。配置值在网络传输和数据库存储阶段都以密文流转，元数据如项目名、环境名、配置 key、描述和状态保持明文，便于管理和查询。
 
-本项目实现了：
+## 功能概览
 
-- 公网管理接口：注册、登录、配置创建、更新、删除、查询、版本历史、回滚。
-- 内网查询接口：供前置鉴权网关调用，只返回密文配置。
-- 用户隔离：不同注册用户只能管理自己的配置。
-- 邀请码注册：邀请码从 `.env` 读取，缺失或错误时拒绝注册。
-- 配置加密落库：配置值写入数据库前使用信封加密。
-- 客户端解密模型：配置中心查询链路不返回明文，由业务方或 SDK 解密。
-
-更完整的手把手使用流程见 [用户使用指南](docs/USER_GUIDE.md)。
-
-## 架构说明
-
-服务启动后会监听两个 HTTP 地址：
-
-- `public_listen_addr`：公网管理接口，默认 `0.0.0.0:8080`。
-- `internal_listen_addr`：内网查询接口，默认 `127.0.0.1:8081`。
-
-公网接口负责账号体系和配置管理。内网接口默认由前置鉴权网关访问，配置中心本身不重复处理网关鉴权，只通过 `X-Config-User-ID` 识别用户并做数据隔离。
+- 公网管理接口：注册、登录、用户公钥、用户私钥轮换、项目管理、配置创建/更新/删除/查询、版本历史、回滚。
+- 内网查询接口：供前置鉴权网关调用，只返回按项目公钥加密后的密文配置值。
+- 用户隔离：不同注册用户只能管理自己的项目和配置。
+- 双向 RSA 信封加密：客户端用用户公钥加密提交，服务端解密后用服务本地公钥加密入库，读取时再用项目公钥加密返回。
+- 服务本地 RSA 密钥：启动时自动生成 `keys/service_private.pem` 和 `keys/service_public.pem`，后续复用。
 
 ## 快速启动
 
 1. 准备 PostgreSQL 数据库。
 2. 复制 `.env.example` 为 `.env`。
-3. 修改 `.env` 中的数据库连接、邀请码、JWT 密钥和配置主密钥。
+3. 修改数据库连接、邀请码和 JWT 密钥。
 4. 启动服务：
 
 ```powershell
 go run ./cmd/config-service
 ```
 
-服务启动时会自动执行幂等数据库迁移，创建所需表结构。
+服务启动时会自动执行幂等数据库迁移，并在 `keys/` 目录下生成或复用服务 RSA 密钥。`keys/*.pem` 已被 `.gitignore` 忽略。
 
 ## 环境变量
-
-`.env` 示例：
 
 ```env
 pg_host=127.0.0.1
@@ -50,7 +36,11 @@ pg_sslmode=disable
 invite_code=change-this-invite-code
 jwt_secret=change-this-jwt-secret-at-least-16-bytes
 
-config_master_key=0123456789abcdef0123456789abcdef
+service_private_key_path=keys/service_private.pem
+service_public_key_path=keys/service_public.pem
+
+# Optional legacy AES master key, only needed to read old AES-256-GCM records.
+config_master_key=
 config_key_id=default
 
 public_listen_addr=0.0.0.0:8080
@@ -58,136 +48,113 @@ internal_listen_addr=127.0.0.1:8081
 jwt_ttl=24h
 ```
 
-`config_master_key` 必须满足以下任一格式：
+`config_master_key` 现在是兼容旧数据的可选项。新写入数据使用 `RSA-OAEP-SHA256+A256GCM` 信封格式。
 
-- 32 字节原始字符串。
-- 64 位十六进制字符串。
-- 32 字节内容的 base64 编码。
+## 加密流程
 
-生产环境请使用高强度随机密钥，并妥善保存。该密钥不能和数据库密码、JWT 密钥复用。
+配置值使用 RSA 信封加密，而不是直接 RSA 加密整段明文：
 
-## 加密设计
+1. 客户端调用 `GET /api/users/me/public-key` 获取用户公钥。
+2. 客户端用用户公钥加密配置值，提交 `encrypted_value`。
+3. 服务端用用户私钥解密客户端密文。
+4. 服务端用本地服务公钥重新加密后存入数据库。
+5. 查询配置时，服务端用服务私钥解开库内密文，再用项目公钥加密返回。
 
-配置值写入数据库前会先加密。每次写入配置时：
+信封 payload 字段：
 
-1. 服务生成一个随机 Data Encryption Key。
-2. 使用该 Data Encryption Key 通过 `AES-256-GCM` 加密配置值。
-3. 使用 `.env` 中的 `config_master_key` 加密 Data Encryption Key。
-4. 数据库只保存密文、加密后的 Data Encryption Key、nonce、算法和 key id。
+```json
+{
+  "algorithm": "RSA-OAEP-SHA256+A256GCM",
+  "key_id": "project:<id>:<fingerprint>",
+  "encrypted_data_key": "...",
+  "nonce": "...",
+  "value_ciphertext": "..."
+}
+```
 
-查询接口返回密文字段，不返回明文配置。业务方拿到密文后，需要在客户端或业务 SDK 中解密。
+## 主要接口
 
-## 公网管理接口
-
-注册：
+注册用户，`rsa_private_key` 可选；不传则系统生成：
 
 ```http
 POST /api/register
 Content-Type: application/json
+```
 
+```json
 {
   "username": "alice",
   "password": "password123",
-  "invite_code": "change-this-invite-code"
+  "invite_code": "change-this-invite-code",
+  "rsa_private_key": ""
 }
 ```
 
-登录：
+获取用户公钥：
 
 ```http
-POST /api/login
-Content-Type: application/json
-
-{
-  "username": "alice",
-  "password": "password123"
-}
-```
-
-登录成功后，后续公网管理接口需要带上：
-
-```http
+GET /api/users/me/public-key
 Authorization: Bearer <access_token>
+```
+
+创建项目：
+
+```http
+POST /api/projects
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "order-service",
+  "description": "订单服务",
+  "rsa_public_key": "-----BEGIN PUBLIC KEY-----..."
+}
 ```
 
 创建配置：
 
-```http
-POST /api/configs
-Authorization: Bearer <access_token>
-Content-Type: application/json
-
+```json
 {
+  "project_id": "<project_id>",
   "key": "db.password",
-  "value": "secret",
-  "application": "order-service",
   "environment": "prod",
   "description": "数据库密码",
-  "status": "enabled"
+  "status": "enabled",
+  "encrypted_value": {
+    "algorithm": "RSA-OAEP-SHA256+A256GCM",
+    "key_id": "user:<id>:<fingerprint>",
+    "encrypted_data_key": "...",
+    "nonce": "...",
+    "value_ciphertext": "..."
+  }
 }
 ```
 
 其他接口：
 
-- `POST /api/refresh`：刷新访问令牌。
-- `POST /api/logout`：退出登录。
-- `GET /api/configs?application=order-service&environment=prod&limit=50&offset=0`：查询配置列表。
+- `PUT /api/users/me/rsa-private-key`：更换当前用户 RSA 私钥；请求体可传 `rsa_private_key`，为空则系统生成。
+- `GET /api/projects`：查询项目列表。
+- `PUT /api/projects/{id}/rsa-public-key`：更换项目 RSA 公钥。
+- `GET /api/configs?project_id=<project_id>&environment=prod`：查询配置列表。
 - `PUT /api/configs/{id}`：更新配置。
 - `DELETE /api/configs/{id}`：软删除配置。
 - `GET /api/configs/{id}/versions`：查询版本历史。
 - `POST /api/configs/{id}/rollback`：回滚到指定版本。
-- `GET /healthz`：健康检查。
 
-## 内网查询接口
-
-内网接口只返回启用且未删除的配置：
+## 内网查询
 
 ```http
-GET /internal/configs?application=order-service&environment=prod
+GET /internal/configs?project_id=<project_id>&environment=prod
 X-Config-User-ID: <user_id>
 ```
 
-示例响应：
+响应中的 `encrypted_value` 已按项目公钥加密，业务方使用对应项目私钥解密。
 
-```json
-{
-  "application": "order-service",
-  "environment": "prod",
-  "configs": [
-    {
-      "key": "db.password",
-      "value_ciphertext": "...",
-      "encrypted_data_key": "...",
-      "nonce": "...",
-      "data_key_nonce": "...",
-      "algorithm": "AES-256-GCM",
-      "key_id": "default",
-      "version": 3,
-      "updated_at": "2026-05-21T10:00:00Z"
-    }
-  ]
-}
-```
-
-## 数据表
-
-服务启动时会自动创建：
-
-- `users`：用户账号、密码哈希和状态。
-- `configs`：当前配置记录。
-- `config_versions`：配置历史版本。
-- `audit_logs`：审计日志。
-
-## 开发与验证
-
-运行测试：
+## 开发验证
 
 ```powershell
 go test ./...
-```
-
-构建服务：
-
-```powershell
 go build ./cmd/config-service
 ```
