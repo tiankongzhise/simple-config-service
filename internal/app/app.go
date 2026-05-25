@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/subtle"
 	"errors"
 	"log/slog"
@@ -20,17 +21,22 @@ type App struct {
 	store    *store.Store
 	logger   *slog.Logger
 	envelope configcrypto.Envelope
+	service  *rsa.PrivateKey
 	now      func() time.Time
 }
 
-func New(cfg config.Config, st *store.Store, logger *slog.Logger) (*App, error) {
+func New(cfg config.Config, st *store.Store, logger *slog.Logger, servicePrivateKey *rsa.PrivateKey) (*App, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if servicePrivateKey == nil {
+		return nil, errors.New("service private key is required")
+	}
 	return &App{
-		cfg:    cfg,
-		store:  st,
-		logger: logger,
+		cfg:     cfg,
+		store:   st,
+		logger:  logger,
+		service: servicePrivateKey,
 		envelope: configcrypto.Envelope{
 			MasterKey: cfg.MasterKey,
 			KeyID:     cfg.KeyID,

@@ -17,6 +17,7 @@ import (
 	"simple-config-service/internal/config"
 	"simple-config-service/internal/httpapi"
 	"simple-config-service/internal/store"
+	"simple-config-service/pkg/configcrypto"
 )
 
 func main() {
@@ -48,8 +49,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	serviceKey, err := configcrypto.LoadOrCreateRSAKeyPair(cfg.ServicePrivateKeyPath, cfg.ServicePublicKeyPath)
+	if err != nil {
+		logger.Error("load service rsa key pair", "error", err)
+		os.Exit(1)
+	}
+	logger.Info("service rsa key ready", "public_key", cfg.ServicePublicKeyPath)
+
 	st := store.New(db)
-	svc, err := app.New(cfg, st, logger)
+	svc, err := app.New(cfg, st, logger, serviceKey)
 	if err != nil {
 		logger.Error("create app", "error", err)
 		os.Exit(1)

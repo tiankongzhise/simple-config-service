@@ -29,6 +29,9 @@ type Config struct {
 	MasterKey []byte
 	KeyID     string
 
+	ServicePrivateKeyPath string
+	ServicePublicKeyPath  string
+
 	PublicListenAddr   string
 	InternalListenAddr string
 }
@@ -68,7 +71,6 @@ func Load(path string) (Config, error) {
 		"pg_database",
 		"invite_code",
 		"jwt_secret",
-		"config_master_key",
 	}
 	var missing []string
 	for _, key := range requiredKeys {
@@ -80,25 +82,30 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
 	}
 
-	masterKey, err := configcrypto.ParseMasterKey(required(values, "config_master_key"))
-	if err != nil {
-		return Config{}, fmt.Errorf("config_master_key: %w", err)
+	var masterKey []byte
+	if masterKeyValue := required(values, "config_master_key"); masterKeyValue != "" {
+		masterKey, err = configcrypto.ParseMasterKey(masterKeyValue)
+		if err != nil {
+			return Config{}, fmt.Errorf("config_master_key: %w", err)
+		}
 	}
 
 	cfg := Config{
-		PGHost:             required(values, "pg_host"),
-		PGPort:             pgPort,
-		PGUser:             required(values, "pg_user"),
-		PGPassword:         required(values, "pg_password"),
-		PGDatabase:         required(values, "pg_database"),
-		PGSSLMode:          get(values, "pg_sslmode", "disable"),
-		InviteCode:         required(values, "invite_code"),
-		JWTSecret:          []byte(required(values, "jwt_secret")),
-		JWTTTL:             jwtTTL,
-		MasterKey:          masterKey,
-		KeyID:              get(values, "config_key_id", "default"),
-		PublicListenAddr:   get(values, "public_listen_addr", "0.0.0.0:8080"),
-		InternalListenAddr: get(values, "internal_listen_addr", "127.0.0.1:8081"),
+		PGHost:                required(values, "pg_host"),
+		PGPort:                pgPort,
+		PGUser:                required(values, "pg_user"),
+		PGPassword:            required(values, "pg_password"),
+		PGDatabase:            required(values, "pg_database"),
+		PGSSLMode:             get(values, "pg_sslmode", "disable"),
+		InviteCode:            required(values, "invite_code"),
+		JWTSecret:             []byte(required(values, "jwt_secret")),
+		JWTTTL:                jwtTTL,
+		MasterKey:             masterKey,
+		KeyID:                 get(values, "config_key_id", "default"),
+		ServicePrivateKeyPath: get(values, "service_private_key_path", "keys/service_private.pem"),
+		ServicePublicKeyPath:  get(values, "service_public_key_path", "keys/service_public.pem"),
+		PublicListenAddr:      get(values, "public_listen_addr", "0.0.0.0:8080"),
+		InternalListenAddr:    get(values, "internal_listen_addr", "127.0.0.1:8081"),
 	}
 
 	if len(cfg.JWTSecret) < 16 {
