@@ -32,6 +32,11 @@ func (h *PublicHandler) routes() {
 	h.mux.HandleFunc("POST /api/login", h.login)
 	h.mux.HandleFunc("POST /api/refresh", h.refresh)
 	h.mux.HandleFunc("POST /api/logout", h.auth(h.logout))
+	h.mux.HandleFunc("GET /api/users/me/public-key", h.auth(h.userPublicKey))
+	h.mux.HandleFunc("PUT /api/users/me/rsa-private-key", h.auth(h.rotateUserRSAKey))
+	h.mux.HandleFunc("POST /api/projects", h.auth(h.createProject))
+	h.mux.HandleFunc("GET /api/projects", h.auth(h.listProjects))
+	h.mux.HandleFunc("PUT /api/projects/{id}/rsa-public-key", h.auth(h.updateProjectRSAKey))
 	h.mux.HandleFunc("POST /api/configs", h.auth(h.createConfig))
 	h.mux.HandleFunc("GET /api/configs", h.auth(h.listConfigs))
 	h.mux.HandleFunc("PUT /api/configs/{id}", h.auth(h.updateConfig))
@@ -108,6 +113,66 @@ func (h *PublicHandler) logout(w http.ResponseWriter, r *http.Request, user app.
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+func (h *PublicHandler) userPublicKey(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
+	response, err := h.app.GetUserPublicKey(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *PublicHandler) rotateUserRSAKey(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
+	var input app.RotateUserRSAKeyInput
+	if err := readJSON(r, &input); err != nil {
+		writeError(w, err)
+		return
+	}
+	response, err := h.app.RotateUserRSAPrivateKey(r.Context(), user.ID, input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *PublicHandler) createProject(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
+	var input app.ProjectInput
+	if err := readJSON(r, &input); err != nil {
+		writeError(w, err)
+		return
+	}
+	project, err := h.app.CreateProject(r.Context(), user.ID, input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, toProjectResponse(project))
+}
+
+func (h *PublicHandler) listProjects(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
+	projects, err := h.app.ListProjects(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"projects": toProjectResponses(projects)})
+}
+
+func (h *PublicHandler) updateProjectRSAKey(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
+	var input app.ProjectPublicKeyInput
+	if err := readJSON(r, &input); err != nil {
+		writeError(w, err)
+		return
+	}
+	project, err := h.app.UpdateProjectRSAKey(r.Context(), user.ID, r.PathValue("id"), input)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toProjectResponse(project))
+}
+
 func (h *PublicHandler) createConfig(w http.ResponseWriter, r *http.Request, user app.PublicUser) {
 	var input app.ConfigInput
 	if err := readJSON(r, &input); err != nil {
@@ -156,12 +221,23 @@ func (h *PublicHandler) listConfigs(w http.ResponseWriter, r *http.Request, user
 		writeError(w, err)
 		return
 	}
-	configs, err := h.app.ListConfigs(r.Context(), user.ID, query.Get("application"), query.Get("environment"), limit, offset)
-	if err != nil {
-		writeError(w, err)
-		return
+	var configs []configResponse
+	if projectID := strings.TrimSpace(query.Get("project_id")); projectID != "" {
+		configList, err := h.app.ListProjectConfigs(r.Context(), user.ID, projectID, query.Get("environment"), limit, offset)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		configs = toConfigResponses(configList)
+	} else {
+		configList, err := h.app.ListConfigs(r.Context(), user.ID, query.Get("application"), query.Get("environment"), limit, offset)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		configs = toConfigResponses(configList)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"configs": toConfigResponses(configs)})
+	writeJSON(w, http.StatusOK, map[string]any{"configs": configs})
 }
 
 func (h *PublicHandler) listVersions(w http.ResponseWriter, r *http.Request, user app.PublicUser) {

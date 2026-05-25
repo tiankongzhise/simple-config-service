@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"simple-config-service/internal/app"
+	"simple-config-service/internal/store"
 )
 
 const userIDHeader = "X-Config-User-ID"
@@ -42,14 +43,25 @@ func (h *InternalHandler) health(w http.ResponseWriter, r *http.Request) {
 func (h *InternalHandler) configs(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	userID := r.Header.Get(userIDHeader)
-	configs, err := h.app.InternalConfigs(r.Context(), userID, query.Get("application"), query.Get("environment"))
+	var responseConfigs []internalConfigResponse
+	var err error
+	if projectID := query.Get("project_id"); projectID != "" {
+		var list []store.Config
+		list, err = h.app.InternalProjectConfigs(r.Context(), userID, projectID, query.Get("environment"))
+		responseConfigs = toInternalConfigResponses(list)
+	} else {
+		var list []store.Config
+		list, err = h.app.InternalConfigs(r.Context(), userID, query.Get("application"), query.Get("environment"))
+		responseConfigs = toInternalConfigResponses(list)
+	}
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"project_id":  query.Get("project_id"),
 		"application": query.Get("application"),
 		"environment": query.Get("environment"),
-		"configs":     toInternalConfigResponses(configs),
+		"configs":     responseConfigs,
 	})
 }
